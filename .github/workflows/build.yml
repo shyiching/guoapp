@@ -1,11 +1,10 @@
 name: Build app packages
 
 on:
-  push: # 任何分支有變動、收到 push 就立刻自動編譯
-  workflow_dispatch: # 保留手動觸發按鈕
+  workflow_dispatch:
 
 permissions:
-  contents: write # 提升權限以利自動創建 Release
+  contents: read
 
 concurrency:
   group: app-build-${{ github.workflow }}-${{ github.ref }}
@@ -60,25 +59,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # 已移除：限制只能在 main 分支手動發佈的檢查
-          
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "只能从 main 分支手动发布，当前为 $GITHUB_REF。" >&2
+            exit 1
+          fi
           version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n1)
           if [ -z "$version" ]; then
             echo "pubspec.yaml 缺少 version。" >&2
             exit 1
           fi
-          
-          # 為了避免重覆推代碼導致版本衝突，我們在 tag 後面加上當前 commit 的短雜湊值和時間戳記
-          short_sha=$(git rev-parse --short HEAD)
-          timestamp=$(date +%s)
-          tag="app-v${version//+/-}-${short_sha}-${timestamp}"
-          
+          tag="app-v${version//+/-}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null || gh release view "$tag" >/dev/null 2>&1; then
+            echo "版本 $version（$tag）已发布过，请先提升 pubspec.yaml 的 version。" >&2
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-  android:
+  windows:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 45
     strategy: &editions
       fail-fast: false
@@ -88,79 +88,6 @@ jobs:
             arguments: ''
           - edition: zhenguojian
             arguments: '--all-sources'
-    steps:
-      - uses: actions/checkout@v4
-      - &setup-python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - *setup-go
-      - *setup-flutter
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: "platforms;android-36"
-          accept-android-sdk-licenses: true
-      - run: sdkmanager 'ndk;28.2.13676358'
-      - name: Configure Android signing
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
-            echo "未配置签名 Secrets，拒绝发布 debug 签名的 APK。" >&2
-            exit 1
-          fi
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$RUNNER_TEMP/release.jks"
-          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
-      - run: python scripts/build_android.py ${{ matrix.arguments }}
-        env:
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-      - name: 校验 APK 签名证书
-        shell: bash
-        env:
-          ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
-        run: |
-          set -euo pipefail
-          expected=$(printf '%s' "$ANDROID_CERT_SHA256" | tr -d ': ' | tr '[:upper:]' '[:lower:]')
-          if [ -z "$expected" ]; then
-            echo "未设置仓库变量 ANDROID_CERT_SHA256，无法确认发布证书。" >&2
-            exit 1
-          fi
-          apksigner=$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f 2>/dev/null | sort | tail -n1 || true)
-          if [ -z "$apksigner" ]; then
-            sdkmanager 'build-tools;35.0.0' >/dev/null
-            apksigner=$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f | sort | tail -n1)
-          fi
-          echo "apksigner：$apksigner"
-          "$apksigner" --version || true
-          for apk in dist/android/*.apk; do
-            echo "== $(basename "$apk")"
-            output=$("$apksigner" verify --print-certs "$apk" 2>&1 || true)
-            printf '%s\n' "$output"
-            if ! printf '%s' "$output" | tr -d ':' | tr '[:upper:]' '[:lower:]' | grep "$expected" >/dev/null; then
-              echo "签名证书与发布证书不一致，已终止。" >&2
-              exit 1
-            fi
-          done
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.edition }}-android
-          path: dist/android/*
-          if-no-files-found: error
-          retention-days: 14
-
-  windows:
-    needs: prepare
-    runs-on: windows-latest
-    timeout-minutes: 45
-    strategy: *editions
     steps:
       - uses: actions/checkout@v4
       - *setup-go
@@ -185,42 +112,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  ios:
-    needs: prepare
-    runs-on: macos-latest
-    timeout-minutes: 60
-    strategy: *editions
-    steps:
-      - uses: actions/checkout@v4
-      - *setup-python
-      - *setup-go
-      - *setup-flutter
-      - name: Check Xcode and CocoaPods
-        shell: bash
-        run: |
-          set -euo pipefail
-          xcode-select -p
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
-          xcrun --sdk iphoneos --find clang
-          if ! command -v pod >/dev/null 2>&1; then
-            brew install cocoapods
-          fi
-          pod --version
-          go version
-          flutter --version
-          flutter precache --ios
-      - name: Build unsigned iOS packages
-        run: python scripts/build_ios.py ${{ matrix.arguments }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.edition }}-ios-unsigned
-          path: dist/ios/*
-          if-no-files-found: error
-          retention-days: 14
-
   release:
-    needs: [checks, prepare, android, windows, ios]
+    needs: [checks, prepare, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -236,7 +129,52 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
           TAG: ${{ needs.prepare.outputs.tag }}
-          ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
         run: |
-          # 補上原本缺少的 gh release 創建指令，讓每次 Push 的產物能自動上架
-          gh release create "$TAG" release/* --title "測試版 - $VERSION" --notes "自動編譯產物"
+          set -euo pipefail
+          cat > notes.md <<EOF
+          版本 ${VERSION}。两个版本功能相同，区别只在站源范围，按需选择：
+
+
+          - 红果鉴 hongguojian：仅红果站源
+          - 真果鉴 zhenguojian：全部站源
+
+
+          Windows：
+          - *-windows-x64.zip：解压后运行 hongguojian.exe 或 zhenguojian.exe
+
+          EOF
+          changes="$(awk -v heading="## ${VERSION}" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found && !started && /^[[:space:]]*$/ { next }
+            found { started = 1; print }
+          ' CHANGELOG.md)"
+          printf '%s' "$changes" > changes.md
+          if [ -n "$changes" ]; then
+            { printf '更新内容：\n\n%s\n\n' "$changes"; cat notes.md; } > notes.tmp
+            mv notes.tmp notes.md
+          fi
+          gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "红果鉴 / 真果鉴 ${VERSION}" --notes-file notes.md
+      - name: 推送到 Telegram 频道
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "未配置 Telegram，跳过推送。"
+            exit 0
+          fi
+          changes="$(cat changes.md)"
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          text="红果鉴 / 真果鉴 ${VERSION} 已发布"
+          if [ -n "$changes" ]; then
+            text="$(printf '%s\n\n更新内容：\n\n%s' "$text" "${changes:0:3500}")"
+          fi
+          text="$(printf '%s\n\n下载：%s' "$text" "$url")"
+          curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}" >/dev/null
